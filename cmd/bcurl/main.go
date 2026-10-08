@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -21,22 +22,26 @@ const (
 	exitUsage    = 2
 	exitClient   = 4
 	exitServer   = 5
+
+	// maxPath is the largest path the 2-byte path length of SPEC.md section 3 can carry.
+	maxPath = 1<<16 - 1
+	// README.md maps only 1xx to 5xx to exit codes. Any other status is a protocol error.
+	minStatus = 100
+	maxStatus = 599
 )
 
 var verbose bool
 
-// show writes the summary line and hexdump of one frame. The bytes come from frame.Write,
-// so they are exactly what goes on (or came off) the wire; the reserved byte is always 0.
-func show(prefix, summary, extra string, f frame.Frame) {
+// show writes the summary line and hexdump of one frame. raw is the frame exactly as it
+// went on or came off the wire, so a received reserved byte or flag bit shows as sent.
+func show(prefix, summary, extra string, raw []byte) {
 	if !verbose {
 		return
 	}
-	var buf bytes.Buffer
-	_ = frame.Write(&buf, f)
-	fmt.Fprintf(os.Stderr, "%s%s flags=0x%02x length=%d%s\n", prefix, summary, f.Flags, len(f.Payload), extra)
+	fmt.Fprintf(os.Stderr, "%s%s flags=0x%02x length=%d%s\n", prefix, summary, raw[2], len(raw)-frame.HeaderLen, extra)
 	var dump strings.Builder
 	d := hex.Dumper(&dump)
-	d.Write(buf.Bytes())
+	d.Write(raw)
 	d.Close()
 	for _, line := range strings.SplitAfter(dump.String(), "\n") {
 		if line != "" {
@@ -64,6 +69,11 @@ func main() {
 		os.Exit(exitUsage)
 	}
 	paths := append([]string{"/" + first}, flag.Args()[1:]...)
+	for _, p := range paths {
+		if len(p) > maxPath {
+			fail(exitUsage, "path is %d bytes, over the %d-byte limit", len(p), maxPath)
+		}
+	}
 
 	conn, err := net.Dial("tcp", hostport)
 	if err != nil {
@@ -92,17 +102,28 @@ func exchange(conn net.Conn, hostport, path string) uint16 {
 		{Name: "user-agent", Value: "bcurl/1"},
 		{Name: "accept", Value: "*/*"},
 	}}
-	out := frame.Frame{Type: frame.TypeRequest, Flags: frame.FlagEnd, Payload: req.Encode()}
-	show("> ", "REQUEST", "", out)
-	if err := frame.Write(conn, out); err != nil {
+	// A request is far under the cap, so Write to a buffer cannot fail.
+	var out bytes.Buffer
+	frame.Write(&out, frame.Frame{Type: frame.TypeRequest, Flags: frame.FlagEnd, Payload: req.Encode()})
+	show("> ", "REQUEST", "", out.Bytes())
+	if _, err := conn.Write(out.Bytes()); err != nil {
 		fail(exitProtocol, "send: %v", err)
+	}
+
+	// With -v, raw records each received frame as it comes off the wire.
+	var raw bytes.Buffer
+	var in io.Reader = conn
+	if verbose {
+		in = io.TeeReader(conn, &raw)
 	}
 
 	var status uint16
 	gotResponse := false
 	for {
 		conn.SetReadDeadline(time.Now().Add(readTimeout))
-		f, err := frame.Read(conn)
+		raw.Reset()
+		// Skip unknown types without keeping them: a 16 MiB one costs no memory.
+		f, err := frame.ReadKeep(in, isBody)
 		if err != nil {
 			fail(exitProtocol, "read: %v", err)
 		}
@@ -116,15 +137,18 @@ func exchange(conn net.Conn, hostport, path string) uint16 {
 				fail(exitProtocol, "bad RESPONSE: %v", err)
 			}
 			status, gotResponse = r.Status, true
-			show("< ", "RESPONSE", fmt.Sprintf(" status=%d", r.Status), f)
+			show("< ", "RESPONSE", fmt.Sprintf(" status=%d", r.Status), raw.Bytes())
+			if status < minStatus || status > maxStatus {
+				fail(exitProtocol, "status %d is not 1xx to 5xx", status)
+			}
 		case frame.TypeData:
 			if !gotResponse {
 				fail(exitProtocol, "DATA before RESPONSE")
 			}
-			show("< ", "DATA", "", f)
+			show("< ", "DATA", "", raw.Bytes())
 			os.Stdout.Write(f.Payload)
 		default:
-			show("< ", fmt.Sprintf("UNKNOWN(0x%02x)", f.Type), "", f)
+			show("< ", fmt.Sprintf("UNKNOWN(0x%02x)", f.Type), "", raw.Bytes())
 			continue // SPEC.md section 2: skip unknown types, and ignore their END flag
 		}
 		if f.Flags&frame.FlagEnd != 0 {
@@ -132,3 +156,5 @@ func exchange(conn net.Conn, hostport, path string) uint16 {
 		}
 	}
 }
+
+func isBody(typ uint8) bool { return typ == frame.TypeResponse || typ == frame.TypeData }
