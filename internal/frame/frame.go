@@ -3,10 +3,10 @@
 package frame
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
-	"strings"
 )
 
 const (
@@ -44,6 +44,13 @@ type Frame struct {
 // It returns io.EOF at a clean frame boundary, io.ErrUnexpectedEOF inside a frame,
 // and ErrBadVersion or ErrTooLarge for a bad header (checked before the payload is read).
 func Read(r io.Reader) (Frame, error) {
+	return ReadKeep(r, func(uint8) bool { return true })
+}
+
+// ReadKeep is Read, but it keeps the payload only when keep(type) is true. For any
+// other type it discards the payload as it arrives and returns a nil Payload, so a
+// frame the caller only skips (SPEC.md section 2) costs no memory.
+func ReadKeep(r io.Reader, keep func(typ uint8) bool) (Frame, error) {
 	var h [HeaderLen]byte
 	// ReadFull gives io.EOF only when it read 0 bytes: a clean frame boundary.
 	if _, err := io.ReadFull(r, h[:]); err != nil {
@@ -52,7 +59,7 @@ func Read(r io.Reader) (Frame, error) {
 	if h[0] != Version {
 		return Frame{}, ErrBadVersion
 	}
-	n := binary.BigEndian.Uint32(h[4:])
+	n := int64(binary.BigEndian.Uint32(h[4:]))
 	if n > MaxPayload {
 		return Frame{}, ErrTooLarge
 	}
@@ -60,11 +67,20 @@ func Read(r io.Reader) (Frame, error) {
 	if n == 0 {
 		return f, nil
 	}
-	f.Payload = make([]byte, n)
-	if _, err := io.ReadFull(r, f.Payload); err != nil {
-		if err == io.EOF { // EOF inside a frame is an error, not a clean close.
-			err = io.ErrUnexpectedEOF
-		}
+	var got int64
+	var err error
+	if keep(f.Type) {
+		// Grow with the bytes that arrive, not with the length the peer claims:
+		// a 16 MiB length field with no bytes behind it must not cost 16 MiB.
+		f.Payload, err = io.ReadAll(io.LimitReader(r, n))
+		got = int64(len(f.Payload))
+	} else {
+		got, err = io.CopyN(io.Discard, r, n)
+	}
+	if err == io.EOF || err == nil && got < n { // EOF inside a frame is an error, not a clean close.
+		err = io.ErrUnexpectedEOF
+	}
+	if err != nil {
 		return Frame{}, err
 	}
 	return f, nil
@@ -182,11 +198,12 @@ func DecodeRequest(p []byte) (Request, error) {
 		return Request{}, ErrMalformed
 	}
 	path, rest, ok := take(p[3:], int(binary.BigEndian.Uint16(p[1:3])))
-	if !ok || len(path) == 0 || path[0] != '/' || strings.IndexByte(string(path), 0) >= 0 {
+	if !ok || len(path) == 0 || path[0] != '/' || bytes.IndexByte(path, 0) >= 0 {
 		return Request{}, ErrMalformed
 	}
-	for _, seg := range strings.Split(string(path), "/") {
-		if seg == ".." {
+	// SplitSeq allocates nothing, so a path of 65,535 slashes stays cheap.
+	for seg := range bytes.SplitSeq(path, []byte("/")) {
+		if string(seg) == ".." {
 			return Request{}, ErrMalformed
 		}
 	}
