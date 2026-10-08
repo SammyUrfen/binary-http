@@ -33,14 +33,17 @@ Why HTTP/2 chose 24 / 8 / 8 / 31: 24 bits of length keep frames small (16 KiB de
 | `0x02` | RESPONSE | server | status, header block (section 3) |
 | `0x03` | DATA | server | raw body bytes |
 
-**The skip rule.** A receiver that reads a frame of a type it does not know MUST read and discard its `length` payload bytes, then continue with the next frame. It MUST NOT reply, fail or close. This holds in both directions and at any point on the connection. A server that gets a DATA frame from a client also skips it.
+**The skip rule.** A receiver that reads a frame of a type it does not know MUST read and discard its `length` payload bytes, then continue with the next frame. It MUST NOT reply, fail or close. This holds in both directions and at any point on the connection. A server skips every type except REQUEST. A client skips every type except RESPONSE and DATA.
+
+A client that gets DATA before RESPONSE, or a RESPONSE payload under 2 bytes, has a protocol error. It drops the connection.
 
 ## 3. Payloads
 
 **REQUEST payload:** `method` (1 byte) | `path length` (2 bytes) | `path` (bytes) | header block (all remaining bytes).
 
 - Method `0x01` is GET. BH/1 defines no other method.
-- The path MUST start with `/`. It MUST NOT contain a `0x00` byte or a `..` segment. BH/1 does no percent-decoding.
+- The path MUST start with `/`. It MUST NOT contain a `0x00` byte or a `..` segment (a part between two `/` that is exactly `..`). BH/1 does no percent-decoding.
+- The server ignores the flags of a REQUEST.
 
 **RESPONSE payload:** `status` (2 bytes, for example `0x00C8` = 200) | header block (all remaining bytes).
 
@@ -74,12 +77,14 @@ These are the ten names that BH/1 tools send. Any other name goes as a literal. 
 
 | Status | When | Connection |
 |---|---|---|
-| 200 | The file exists and the server can read it | stays open |
+| 200 | The file exists and the server can read it. The response MUST include `content-type` and `content-length` | stays open |
 | 400 | The REQUEST payload is malformed (section 3 rules, a truncated entry, a name length of 0) | stays open, because the frame boundary is still known |
-| 400 | The header is bad: version is not `0x01`, or length is over the cap | the server sends `connection: close`, then closes, because it cannot find the next frame |
-| 404 | No regular file at the path | stays open |
+| 400 | The header is bad: version is not `0x01`, or length is over the cap | the server does not read the payload. It sends `connection: close`, then closes, because it cannot find the next frame |
+| 404 | No regular file at the path: also a folder, a missing `index.html`, or a link out of the root | stays open |
 | 405 | The method is not GET. The response includes `allow: GET` | stays open |
 | 500 | The file exists but the server cannot read it | stays open |
+
+The server checks in this order: the section 3 rules (400), then the method (405), then the file (404, 500 or 200).
 
 The server maps a path to a file under its root folder. A path that ends in `/` maps to `index.html` in that folder. The server MUST NOT serve a file outside the root, also through a symbolic link. Error responses MAY carry a short `text/plain` body.
 
