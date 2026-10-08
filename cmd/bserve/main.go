@@ -24,6 +24,10 @@ import (
 const (
 	// idleTimeout is the SPEC.md section 5 limit on silence between frames.
 	idleTimeout = 30 * time.Second
+	// writeTimeout bounds each write to the socket. A client that stops reading
+	// fills the socket buffers, the write blocks, and the deadline frees the goroutine.
+	// A slow client still gets a large file, because every write gets a fresh deadline.
+	writeTimeout = 30 * time.Second
 	// httpDate is the HTTP date layout. net/http is off limits, so it is copied here.
 	httpDate      = "Mon, 02 Jan 2006 15:04:05 GMT"
 	serverName    = "bserve/1"
@@ -67,13 +71,14 @@ func main() {
 // serve answers the requests on one connection in order, one at a time.
 func serve(c net.Conn, root *os.Root) {
 	defer c.Close()
-	br, bw := bufio.NewReader(c), bufio.NewWriter(c)
+	br, bw := bufio.NewReader(c), bufio.NewWriter(deadlineWriter{c})
 	remote := c.RemoteAddr().String()
 	for {
 		if err := c.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
 			return
 		}
-		f, err := frame.Read(br)
+		// Keep only REQUEST payloads: a skipped frame of 16 MiB costs no memory.
+		f, err := frame.ReadKeep(br, isRequest)
 		switch {
 		case errors.Is(err, frame.ErrBadVersion), errors.Is(err, frame.ErrTooLarge):
 			// The frame boundary is lost, so say 400 once and close.
@@ -109,6 +114,18 @@ func serve(c net.Conn, root *os.Root) {
 			return
 		}
 	}
+}
+
+func isRequest(typ uint8) bool { return typ == frame.TypeRequest }
+
+// deadlineWriter gives each write to the connection a fresh writeTimeout.
+type deadlineWriter struct{ net.Conn }
+
+func (w deadlineWriter) Write(p []byte) (int, error) {
+	if err := w.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return 0, err
+	}
+	return w.Conn.Write(p)
 }
 
 func methodName(m uint8) string {
