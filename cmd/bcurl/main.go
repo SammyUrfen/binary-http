@@ -34,23 +34,15 @@ func show(prefix, summary, extra string, f frame.Frame) {
 	var buf bytes.Buffer
 	_ = frame.Write(&buf, f)
 	fmt.Fprintf(os.Stderr, "%s%s flags=0x%02x length=%d%s\n", prefix, summary, f.Flags, len(f.Payload), extra)
-	d := hex.Dumper(&prefixWriter{prefix})
+	var dump strings.Builder
+	d := hex.Dumper(&dump)
 	d.Write(buf.Bytes())
 	d.Close()
-}
-
-// prefixWriter puts prefix at the start of every line that hex.Dumper writes to stderr.
-type prefixWriter struct {
-	prefix string
-}
-
-func (p *prefixWriter) Write(b []byte) (int, error) {
-	for _, line := range strings.SplitAfter(string(b), "\n") {
+	for _, line := range strings.SplitAfter(dump.String(), "\n") {
 		if line != "" {
-			fmt.Fprint(os.Stderr, p.prefix+line)
+			fmt.Fprint(os.Stderr, prefix+line)
 		}
 	}
-	return len(b), nil
 }
 
 func fail(code int, format string, a ...any) {
