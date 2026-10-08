@@ -28,6 +28,8 @@ const (
 	// fills the socket buffers, the write blocks, and the deadline frees the goroutine.
 	// A slow client still gets a large file, because every write gets a fresh deadline.
 	writeTimeout = 30 * time.Second
+	// acceptBackoff pauses the accept loop after an error such as EMFILE.
+	acceptBackoff = 50 * time.Millisecond
 	// httpDate is the HTTP date layout. net/http is off limits, so it is copied here.
 	httpDate      = "Mon, 02 Jan 2006 15:04:05 GMT"
 	serverName    = "bserve/1"
@@ -61,7 +63,9 @@ func main() {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
+			// EMFILE and similar errors repeat at once. A short pause stops a hot loop.
 			log.Print("accept: ", err)
+			time.Sleep(acceptBackoff)
 			continue
 		}
 		go serve(c, root)
@@ -147,6 +151,11 @@ func sendFile(w io.Writer, root *os.Root, p string) (int, error) {
 	name := strings.TrimPrefix(p, "/")
 	if name == "" || strings.HasSuffix(name, "/") {
 		name += indexFile
+	}
+	// Stat before Open: opening a FIFO or a device for read can block forever.
+	if st, err := root.Stat(name); err == nil && !st.Mode().IsRegular() {
+		reply(w, 404)
+		return 404, nil
 	}
 	file, err := root.Open(name)
 	if err != nil {

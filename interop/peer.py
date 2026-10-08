@@ -128,7 +128,7 @@ def error(sock, status, extra=(), text=b""):
 
 
 def handle_request(sock, root, p):
-    # Structure first (400, stays open), then method (405), then path rules.
+    # SPEC.md section 5 order: every section 3 rule (400), then the method (405), then the file.
     if len(p) < 3:
         return error(sock, 400, text=b"bad request\n")
     method, plen = p[0], struct.unpack(">H", p[1:3])[0]
@@ -139,11 +139,11 @@ def handle_request(sock, root, p):
         decode_headers(p[3 + plen:])
     except Malformed:
         return error(sock, 400, text=b"bad request\n")
-    if method != 1:
-        return error(sock, 405, [("allow", "GET")], b"method not allowed\n")
     if (not path.startswith(b"/") or b"\0" in path
             or b".." in path.split(b"/")):
         return error(sock, 400, text=b"bad path\n")
+    if method != 1:
+        return error(sock, 405, [("allow", "GET")], b"method not allowed\n")
     status, full = resolve(root, path.decode("latin-1"))
     if status == 200:
         try:

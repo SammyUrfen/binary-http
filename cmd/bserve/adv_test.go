@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -243,4 +244,16 @@ func TestAdvHalfCloseStillAnswered(t *testing.T) {
 	if _, _, err := readFrame(c); err != io.EOF {
 		t.Fatalf("after the last response: err = %v, want io.EOF", err)
 	}
+}
+
+// A FIFO in the root must not hang the connection: opening one for read blocks until a writer appears.
+func TestFIFONotServed(t *testing.T) {
+	addr, root := setup(t)
+	if err := syscall.Mkfifo(filepath.Join(root, "pipe"), 0o644); err != nil {
+		t.Skip("mkfifo:", err)
+	}
+	c := dial(t, addr)
+	send(t, c, get("/pipe"))
+	wantStatus(t, readResponse(t, c), 404)
+	expectOpen(t, c)
 }
